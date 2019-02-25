@@ -112,7 +112,7 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
   #     Tags:      { 'tag:Environment' => 'Production' }
   #     Volumes:   { 'attachment.status' => 'attached' }
   #
-  # This needs to follow the AWS convention of specifiying filters.
+  # This needs to follow the AWS convention of specifying filters.
   #
   # Each namespace uniquely supports certain dimensions. Consult the documentation
   # to ensure you're using valid filters.
@@ -146,10 +146,11 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
   #
   # @param queue [Array] Logstash queue
   def run(queue)
+    @priority = []
     while !stop?
       start = Time.now
 
-      @logger.info('Polling CloudWatch API')
+      @logger.debug('Polling CloudWatch API')
 
       raise 'No metrics to query' unless metrics_for(@namespace).count > 0
 
@@ -180,19 +181,25 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
       # For every resource in the dimension
       dim_resources = *dim_resources
       dim_resources.each do |resource|
-        @logger.debug "Polling resource #{dimension}: #{resource}"
+        @logger.debug "Polling #{metric} for resource #{dimension}: #{resource}"
 
         options = metric_options(@namespace, metric)
         options[:dimensions] = [ { name: dimension, value: resource } ]
-
+        # @logger.debug "options: #{options}"
         datapoints = clients['CloudWatch'].get_metric_statistics(options)
-        @logger.debug "DPs: #{datapoints.data}"
+        # @logger.debug "DPs: #{datapoints.data}"
         # For every event in the resource
         datapoints[:datapoints].each do |datapoint|
+          # @logger.debug "DP: #{datapoints}"
           event_hash = datapoint.to_hash.update(options)
           event_hash[dimension.to_sym] = resource
-          event = LogStash::Event.new(cleanup(event_hash))
+          event_cleaned = cleanup(event_hash)
+          event = LogStash::Event.new(event_cleaned)
           decorate(event)
+          event.set("host", @namespace)
+          event.set("message", event_cleaned)
+          event.set("[cloudwatch_logs][metric]", metric)
+          event.set("[cloudwatch_logs][resource]", resource)
           queue << event
         end
       end
@@ -231,6 +238,7 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
   def cleanup(event)
     event.delete :statistics
     event.delete :dimensions
+    event.delete :FunctionName
     event[:start_time] = Time.parse(event[:start_time]).utc
     event[:end_time]   = Time.parse(event[:end_time]).utc
     LogStash::Util.stringify_symbols(event)
