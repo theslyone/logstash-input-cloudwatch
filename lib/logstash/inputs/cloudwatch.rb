@@ -5,6 +5,9 @@ require "logstash/plugin_mixins/aws_config"
 require "logstash/util"
 require "stud/interval"
 require "aws-sdk"
+require "logstash/inputs/cloudwatch_logs/patch"
+
+Aws.eager_autoload!
 
 # Pull events from the Amazon Web Services CloudWatch API.
 #
@@ -153,7 +156,7 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
       @logger.debug('Polling CloudWatch API')
 
       raise 'No metrics to query' unless metrics_for(@namespace).count > 0
-
+      
       # For every metric
       metrics_for(@namespace).each do |metric|
         @logger.debug "Polling metric #{metric}"
@@ -181,7 +184,7 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
       # For every resource in the dimension
       dim_resources = *dim_resources
       dim_resources.each do |resource|
-        @logger.debug "Polling #{metric} for resource #{dimension}: #{resource}"
+        @logger.info "Polling #{metric} for resource #{dimension}: #{resource}"
 
         options = metric_options(@namespace, metric)
         options[:dimensions] = [ { name: dimension, value: resource } ]
@@ -190,16 +193,13 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
         # @logger.debug "DPs: #{datapoints.data}"
         # For every event in the resource
         datapoints[:datapoints].each do |datapoint|
-          # @logger.debug "DP: #{datapoints}"
           event_hash = datapoint.to_hash.update(options)
           event_hash[dimension.to_sym] = resource
-          event_cleaned = cleanup(event_hash)
+          event_cleaned = cleanup(event_hash, resource)
           event = LogStash::Event.new(event_cleaned)
           decorate(event)
           event.set("host", @namespace)
           event.set("message", event_cleaned)
-          event.set("[cloudwatch_logs][metric]", metric)
-          event.set("[cloudwatch_logs][resource]", resource)
           queue << event
         end
       end
@@ -224,7 +224,7 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
         event_hash[dimension[:name].to_sym] = dimension[:value]
       end
 
-      event = LogStash::Event.new(cleanup(event_hash))
+      event = LogStash::Event.new(cleanup(event_hash, ''))
       decorate(event)
       queue << event
     end
@@ -235,12 +235,14 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
   # @param event [Hash] Raw event
   #
   # @return [Hash] Cleaned event
-  def cleanup(event)
+  def cleanup(event, resource)
     event.delete :statistics
     event.delete :dimensions
     event.delete :FunctionName
     event[:start_time] = Time.parse(event[:start_time]).utc
     event[:end_time]   = Time.parse(event[:end_time]).utc
+    event[:resource] = resource
+    event[:project_prefix] = project_prefix(resource)    
     LogStash::Util.stringify_symbols(event)
   end
 
@@ -249,6 +251,10 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
   #
   # @return [Hash]
   def clients
+    if namespace == 'AWS/Lambda'
+      # Aws::ConfigService::Client.new(aws_options_hash)
+      # @cloudwatch = Aws::CloudWatchLogs::Client.new(aws_options_hash)
+    end
     @clients ||= Hash.new do |client_hash, namespace|
       namespace = namespace[4..-1] if namespace[0..3] == 'AWS/'
       namespace = 'EC2' if namespace == 'EBS'
@@ -320,7 +326,7 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
   # @return [Array]
   def resources
     case @namespace
-      when 'AWS/EC2'
+    when 'AWS/EC2'
         instances = clients[@namespace].describe_instances(filter_options)[:reservations].collect do |r|
           r[:instances].collect{ |i| i[:instance_id] }
         end.flatten
@@ -334,13 +340,47 @@ class LogStash::Inputs::CloudWatch < LogStash::Inputs::Base
       @logger.debug "AWS/EBS Volumes: #{volumes}"
 
       { 'VolumeId' => volumes }
+    when 'AWS/Lambda'
+      @groups = filter_log_groups
+      @logger.info("groups #{@groups.keys}")
+      { 'FunctionName' => @groups.keys }
     else
       @filters
     end
   end
 
+  def project_prefix(resource)
+    case @namespace
+    when 'AWS/Lambda'
+      @groups[resource]
+    else
+      ''
+    end
+  end
+
   def filter_options
     @filters.nil? ? {} : { :filters => aws_filters }
+  end
+
+  public
+  def filter_log_groups    
+    Aws::ConfigService::Client.new(aws_options_hash)
+    @cloudwatch = Aws::CloudWatchLogs::Client.new(aws_options_hash)
+    groups = {}
+    next_token = nil
+    @filters.each do |group|
+      loop do
+        log_groups = @cloudwatch.describe_log_groups(log_group_name_prefix: group, next_token: next_token)
+        # log_groups = clients['AWS/Log'].describe_log_groups(log_group_name_prefix: group, next_token: next_token)
+        # groups += log_groups.log_groups.map {|n| n.log_group_name.gsub('/aws/lambda/', '')}
+        log_groups.log_groups.each {|n| groups[n.log_group_name.gsub('/aws/lambda/', '')] = group }
+        next_token = log_groups.next_token
+        @logger.debug("found #{log_groups.log_groups.length} log groups matching prefix #{group}")
+        break if next_token.nil?
+      end
+    end
+    
+    groups
   end
 
 end # class LogStash::Inputs::CloudWatch
